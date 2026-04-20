@@ -164,18 +164,18 @@ int head_update(const ObjectID *new_commit) {
 
     char tmp_path[528];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
-    
+
     f = fopen(tmp_path, "w");
     if (!f) return -1;
-    
+
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(new_commit, hex);
     fprintf(f, "%s\n", hex);
-    
+
     fflush(f);
     fsync(fileno(f));
     fclose(f);
-    
+
     return rename(tmp_path, target_path);
 }
 
@@ -194,8 +194,41 @@ int head_update(const ObjectID *new_commit) {
 //
 // Returns 0 on success, -1 on error.
 int commit_create(const char *message, ObjectID *commit_id_out) {
-    // TODO: Implement commit creation
-    // (See Lab Appendix for logical steps)
-    (void)message; (void)commit_id_out;
-    return -1;
+     // Step 1: build the tree from the current index
+    Commit c;
+    if (tree_from_index(&c.tree) != 0) {
+        fprintf(stderr, "error: failed to build tree\n");
+        return -1;
+    }
+     // Step 2: read current HEAD as parent (may not exist for first commit)
+    c.has_parent = 0;
+    ObjectID parent_id;
+    if (head_read(&parent_id) == 0) {
+        c.parent     = parent_id;
+        c.has_parent = 1;
+    }
+    // Step 3: fill in author and timestamp
+    strncpy(c.author, pes_author(), sizeof(c.author) - 1);
+    c.author[sizeof(c.author) - 1] = '\0';
+    c.timestamp = (uint64_t)time(NULL);
+
+    // Step 4: fill in message
+    strncpy(c.message, message, sizeof(c.message) - 1);
+    c.message[sizeof(c.message) - 1] = '\0';
+
+    // Step 5: serialize the commit struct to text
+    void *raw;
+    size_t raw_len;
+    if (commit_serialize(&c, &raw, &raw_len) != 0) return -1;
+
+    // Step 6: write as OBJ_COMMIT
+    if (object_write(OBJ_COMMIT, raw, raw_len, commit_id_out) != 0) {
+        free(raw); return -1;
+    }
+    free(raw);
+
+    // Step 7: update HEAD to point to the new commit
+    return head_update(commit_id_out);
+
+    
 }
