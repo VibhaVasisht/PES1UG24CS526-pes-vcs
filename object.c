@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <openssl/evp.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
@@ -94,9 +95,97 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    // Get type string
+    const char *type_str;
+    switch (type) {
+        case OBJ_BLOB:   type_str = "blob"; break;
+        case OBJ_TREE:   type_str = "tree"; break;
+        case OBJ_COMMIT: type_str = "commit"; break;
+        default: return -1;
+    }
+
+    // Build header: "<type> <size>\0"
+    char header[256];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    if (header_len < 0 || header_len >= (int)sizeof(header)) return -1;
+    header_len++;  // Include the null terminator in the header
+
+    // Allocate buffer for full object (header + data)
+    size_t full_len = header_len + len;
+    void *full_object = malloc(full_len);
+    if (!full_object) return -1;
+
+    // Copy header (with null terminator) and data
+    memcpy(full_object, header, header_len);
+    memcpy((char *)full_object + header_len, data, len);
+
+    // Compute hash of full object
+    compute_hash(full_object, full_len, id_out);
+
+    // Check if object already exists (deduplication)
+    if (object_exists(id_out)) {
+        free(full_object);
+        return 0;
+    }
+
+    // Get file path
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    // Extract shard directory (XX part)
+    char shard_dir[512];
+    snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, path + strlen(OBJECTS_DIR) + 1);
+
+    // Create shard directory if it doesn't exist
+    if (mkdir(shard_dir, 0755) == -1 && errno != EEXIST) {
+        free(full_object);
+        return -1;
+    }
+
+    // Create temporary file in the shard directory
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+
+    // Write to temporary file
+    int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd == -1) {
+        free(full_object);
+        return -1;
+    }
+
+    // Write full object to temp file
+    if (write(fd, full_object, full_len) != (ssize_t)full_len) {
+        close(fd);
+        unlink(temp_path);
+        free(full_object);
+        return -1;
+    }
+
+    // fsync temp file to ensure data reaches disk
+    if (fsync(fd) == -1) {
+        close(fd);
+        unlink(temp_path);
+        free(full_object);
+        return -1;
+    }
+
+    close(fd);
+    free(full_object);
+
+    // Atomically rename temp file to final path
+    if (rename(temp_path, path) == -1) {
+        unlink(temp_path);
+        return -1;
+    }
+
+    // Open and fsync the shard directory to persist the rename
+    int dir_fd = open(shard_dir, O_RDONLY);
+    if (dir_fd != -1) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    return 0;
 }
 
 // Read an object from the store.
@@ -122,7 +211,104 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    // Get file path
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    // Open and read the entire file
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    // Seek to end to determine file size
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    if (file_size < 0) {
+        fclose(f);
+        return -1;
+    }
+
+    // Seek back to beginning and read entire file
+    fseek(f, 0, SEEK_SET);
+    void *file_data = malloc(file_size);
+    if (!file_data) {
+        fclose(f);
+        return -1;
+    }
+
+    size_t read_count = fread(file_data, 1, file_size, f);
+    fclose(f);
+
+    if (read_count != (size_t)file_size) {
+        free(file_data);
+        return -1;
+    }
+
+    // Verify integrity: recompute hash and compare
+    ObjectID computed_id;
+    compute_hash(file_data, file_size, &computed_id);
+
+    if (memcmp(&computed_id, id, sizeof(ObjectID)) != 0) {
+        free(file_data);
+        return -1;  // Corruption detected
+    }
+
+    // Parse header to extract type and size
+    // Find the null terminator that separates header from data
+    void *null_pos = memchr(file_data, '\0', file_size);
+    if (!null_pos) {
+        free(file_data);
+        return -1;  // Invalid format
+    }
+
+    size_t header_len = (char *)null_pos - (char *)file_data;
+    char header[256];
+    if (header_len >= sizeof(header)) {
+        free(file_data);
+        return -1;
+    }
+
+    memcpy(header, file_data, header_len);
+    header[header_len] = '\0';
+
+    // Parse type string
+    ObjectType obj_type;
+    if (strncmp(header, "blob ", 5) == 0) {
+        obj_type = OBJ_BLOB;
+    } else if (strncmp(header, "tree ", 5) == 0) {
+        obj_type = OBJ_TREE;
+    } else if (strncmp(header, "commit ", 7) == 0) {
+        obj_type = OBJ_COMMIT;
+    } else {
+        free(file_data);
+        return -1;  // Unknown type
+    }
+
+    // Extract data portion (everything after the null terminator)
+    size_t data_start = header_len + 1;
+    if (data_start > (size_t)file_size) {
+        free(file_data);
+        return -1;
+    }
+
+    size_t data_len = file_size - data_start;
+
+    // Allocate buffer and copy data
+    void *data_copy = malloc(data_len);
+    if (!data_copy) {
+        free(file_data);
+        return -1;
+    }
+
+    if (data_len > 0) {
+        memcpy(data_copy, (char *)file_data + data_start, data_len);
+    }
+
+    free(file_data);
+
+    // Set output parameters
+    *type_out = obj_type;
+    *data_out = data_copy;
+    *len_out = data_len;
+
+    return 0;
 }
