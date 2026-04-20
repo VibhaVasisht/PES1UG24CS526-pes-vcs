@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
@@ -135,10 +136,49 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    index->count = 0;
+
+    FILE *f = fopen(".pes/index", "r");
+    if (!f) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fclose(f);
+            return -1;
+        }
+
+        char mode_str[16];
+        char hash_hex[HASH_HEX_SIZE + 1];
+        char mtime_str[32];
+        char size_str[32];
+        char path[512];
+
+        int scanned = sscanf(line, "%15s %64s %31s %31s %511[^\n]", mode_str, hash_hex, mtime_str, size_str, path);
+        if (scanned != 5) {
+            fclose(f);
+            return -1;
+        }
+
+        IndexEntry *entry = &index->entries[index->count];
+        entry->mode = (uint32_t)strtol(mode_str, NULL, 8);
+        if (hex_to_hash(hash_hex, &entry->hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+        entry->mtime_sec = (uint64_t)strtoull(mtime_str, NULL, 10);
+        entry->size = (uint32_t)strtoul(size_str, NULL, 10);
+        strncpy(entry->path, path, sizeof(entry->path));
+        entry->path[sizeof(entry->path) - 1] = '\0';
+
+        index->count++;
+    }
+
+    fclose(f);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
